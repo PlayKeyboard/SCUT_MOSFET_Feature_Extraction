@@ -1,0 +1,14 @@
+# 深度学习模型权重文件
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.pb
+*.onnx
+*.weights
+*.model
+
+# 训练日志和中间文件
+events.out.tfevents.*
+checkpoint
+*.log
