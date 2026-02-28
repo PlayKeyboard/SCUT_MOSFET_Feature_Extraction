@@ -147,3 +147,5 @@ if __name__ == "__main__":
         print(np.column_stack([t[:5].reshape(-1, 1), y[:5]]))
 
     save_outputs(MAT_PATH, t, y, idx, name)
+
+    #value = np.load("xxx.npy", allow_pickle=True).item()["value"] # 一键读取数据
