@@ -12,3 +12,11 @@
 events.out.tfevents.*
 checkpoint
 *.log
+
+# Python 虚拟环境与缓存（避免同步到远程仓库）
+.venv/
+.venv*/
+venv/
+env/
+__pycache__/
+*.pyc
