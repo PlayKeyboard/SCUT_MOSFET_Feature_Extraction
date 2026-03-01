@@ -1,0 +1,25 @@
+{
+  "config": {
+    "sample_rate_hz": 10.0,
+    "high_level_threshold": 2.0,
+    "cycles_per_group": 10,
+    "pre_fall_points": 155,
+    "post_fall_points": 245,
+    "edge_min_gap_seconds": 20.0,
+    "peak_smooth_window": 7,
+    "peak_min_prominence_factor": 0.1,
+    "peak_min_gap_seconds": 20.0,
+    "temp_mode": "name",
+    "temp_signal_index": 9,
+    "temp_signal_name": "tempture",
+    "max_groups": 3,
+    "strict_mode": false,
+    "allow_partial_last_group": true,
+    "partial_min_cycles": 3
+  },
+  "temp_signal_name": "tempture",
+  "device_group_count_found": 4,
+  "device_group_count_processed": 4,
+  "group_count": 4,
+  "output_dir": "/Users/louis16/Projects/SCUT_MOSFET_Feature_Extraction/data/aligned_output_dev/12号"
+}

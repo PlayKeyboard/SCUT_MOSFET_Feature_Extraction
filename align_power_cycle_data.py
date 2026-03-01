@@ -21,6 +21,11 @@
 3) 在温度序列中寻找对应 10 周期峰值窗口，以同样 pre 点数回退作为起点，对齐温度切片。
 4) 将同一组的 ch1/ch3/ch5 采用相同索引切片，并与温度做等长裁剪。
 
+新增兼容逻辑（用于异常/失效工况）：
+1) 主流程会跳过温度文件中的 _0_ 独立单循环文件，仅处理常规区间（如 1-10、11-20）。
+2) 最后一组允许不足 10 循环（可配置），避免因器件提前失效导致整组被丢弃。
+3) _0_ 单循环使用专用对齐：ch1 的高->低边沿 对齐 温度最高点，再按电压长度裁切温度。
+
 维护与改参说明（建议先看）：
 1) 你最常改的参数：
    - --high-threshold：电压高电平阈值（默认 2.0V）
@@ -92,6 +97,8 @@ class AlignConfig:
     temp_signal_name: str = "tempture"
     max_groups: int = 0
     strict_mode: bool = False
+    allow_partial_last_group: bool = True
+    partial_min_cycles: int = 3
 
     @property
     def expected_cycle_points(self) -> int:
@@ -139,6 +146,9 @@ class GroupAlignedResult:
     temp_start_idx: int
     temp_end_idx: int
     aligned_len: int
+    used_cycles: int
+    is_partial_group: bool
+    alignment_mode: str
     ch1_segment: np.ndarray
     ch3_segment: np.ndarray
     ch5_segment: np.ndarray
@@ -350,9 +360,11 @@ def discover_pc_group_inputs(pc_dir: Path, device_id: str, required_channels: tu
     return outputs
 
 
-def discover_temperature_files(temp_dir: Path, device_id: str) -> list[Path]:
+def discover_temperature_files(temp_dir: Path, device_id: str) -> tuple[list[Path], list[Path]]:
     """
-    扫描温度目录并按组区间起点排序。
+    扫描温度目录并按规则分桶：
+    - regular_files：常规区间文件（如 1-10 / 11-20）
+    - zero_group_files：_0_ 单循环文件（如 251108_0_12.mat）
 
     命名约定：
     <date>_<range_or_group>_<device_id>.mat
@@ -361,7 +373,8 @@ def discover_temperature_files(temp_dir: Path, device_id: str) -> list[Path]:
     251108_1-10_12.mat
     2511016_11-20_12.mat
     """
-    rows: list[tuple[int, int, str, Path]] = []
+    regular_rows: list[tuple[int, int, str, Path]] = []
+    zero_rows: list[tuple[int, int, str, Path]] = []
     for path in temp_dir.glob("*.mat"):
         m = TEMP_FILE_RE.match(path.name)
         if not m:
@@ -370,9 +383,15 @@ def discover_temperature_files(temp_dir: Path, device_id: str) -> list[Path]:
         if str(int(dev_text)) != str(int(device_id)):
             continue
         start, end = parse_group_range_token(range_text)
-        rows.append((start, end, date_text, path))
-    rows.sort(key=lambda x: (x[0], x[1], x[2], x[3].name))
-    return [x[3] for x in rows]
+        row = (start, end, date_text, path)
+        if start == 0 and end == 0:
+            zero_rows.append(row)
+        else:
+            regular_rows.append(row)
+
+    regular_rows.sort(key=lambda x: (x[0], x[1], x[2], x[3].name))
+    zero_rows.sort(key=lambda x: (x[0], x[1], x[2], x[3].name))
+    return [x[3] for x in regular_rows], [x[3] for x in zero_rows]
 
 
 def load_temperature_series_from_files(temp_files: list[Path], cfg: AlignConfig) -> tuple[np.ndarray, np.ndarray, str]:
@@ -547,6 +566,30 @@ def detect_temperature_peaks(signal: np.ndarray, cfg: AlignConfig) -> np.ndarray
         peaks = np.flatnonzero((smooth[1:-1] > smooth[:-2]) & (smooth[1:-1] >= smooth[2:])) + 1
 
     return np.asarray(peaks, dtype=int)
+
+
+def decide_cycles_for_group(detected_count: int, cfg: AlignConfig, is_last_group: bool) -> tuple[int, bool]:
+    """
+    决定当前组实际采用多少个循环边沿。
+
+    规则：
+    1) 常规情况：>= cycles_per_group 时按满组处理
+    2) 不足满组：仅当“最后一组 + 允许部分组”时启用部分循环
+    3) 部分组仍需满足 partial_min_cycles
+    """
+    target = int(cfg.cycles_per_group)
+    if detected_count >= target:
+        return target, False
+
+    if not (cfg.allow_partial_last_group and is_last_group):
+        raise ValueError(f"检测到边沿数量不足：{detected_count}，期望至少 {target}。")
+
+    used = int(detected_count)
+    if used < int(max(1, cfg.partial_min_cycles)):
+        raise ValueError(
+            f"最后一组边沿数仅 {used}，低于 partial_min_cycles={cfg.partial_min_cycles}，无法做部分组对齐。"
+        )
+    return used, True
 
 
 def _list_temperature_signals_matlab(temp_file: Path) -> list[str]:
@@ -754,7 +797,8 @@ def align_groups(
     results: list[GroupAlignedResult] = []
     temp_cursor = 0
 
-    for item in group_inputs:
+    total_groups = len(group_inputs)
+    for idx, item in enumerate(group_inputs):
         group_id = item.group_id
         try:
             # A) 三通道同步读取；对齐逻辑以 ch1（原电压通道）为基准
@@ -773,9 +817,14 @@ def align_groups(
                 threshold=cfg.high_level_threshold,
                 min_gap_points=cfg.edge_min_gap_points,
             )
+            used_cycles, is_partial = decide_cycles_for_group(
+                detected_count=int(edges_all.size),
+                cfg=cfg,
+                is_last_group=(idx == total_groups - 1),
+            )
             edges_used = select_group_edges(
                 edges=edges_all,
-                cycles_per_group=cfg.cycles_per_group,
+                cycles_per_group=used_cycles,
                 expected_cycle_points=cfg.expected_cycle_points,
             )
 
@@ -796,7 +845,7 @@ def align_groups(
             temp_peaks_rel = detect_temperature_peaks(temp_remaining, cfg)
             temp_peaks_used_rel = select_group_edges(
                 edges=temp_peaks_rel,
-                cycles_per_group=cfg.cycles_per_group,
+                cycles_per_group=used_cycles,
                 expected_cycle_points=cfg.expected_cycle_points,
             )
             temp_peak_rel = int(temp_peaks_used_rel[0])
@@ -845,6 +894,9 @@ def align_groups(
                     temp_start_idx=int(temp_start),
                     temp_end_idx=int(temp_start + common_len),
                     aligned_len=common_len,
+                    used_cycles=used_cycles,
+                    is_partial_group=is_partial,
+                    alignment_mode=("regular_partial_last" if is_partial else "regular_full"),
                     ch1_segment=ch1_aligned,
                     ch3_segment=ch3_aligned,
                     ch5_segment=ch5_aligned,
@@ -862,6 +914,117 @@ def align_groups(
             print(f"[WARN] 器件 {device_id} group={group_id:02d} 跳过，原因: {exc}")
 
     return results
+
+
+def align_zero_group(
+    device_id: str,
+    zero_group_input: GroupInput,
+    zero_temp_file: Path,
+    cfg: AlignConfig,
+) -> tuple[GroupAlignedResult, str]:
+    """
+    _0_ 单循环专用对齐：
+    - 电压锚点：ch1 第一个有效“高->低边沿”
+    - 温度锚点：温度序列最高点
+    - 按电压序列长度裁切温度，必要时两端同步裁剪以保证锚点对应
+    """
+    ch1_raw = load_voltage_signal(zero_group_input.ch1_file)
+    ch3_raw = load_voltage_signal(zero_group_input.ch3_file)
+    ch5_raw = load_voltage_signal(zero_group_input.ch5_file)
+    raw_min_len = int(min(ch1_raw.size, ch3_raw.size, ch5_raw.size))
+    ch1_raw = ch1_raw[:raw_min_len]
+    ch3_raw = ch3_raw[:raw_min_len]
+    ch5_raw = ch5_raw[:raw_min_len]
+
+    edges_all = detect_falling_edges(
+        voltage=ch1_raw,
+        threshold=cfg.high_level_threshold,
+        min_gap_points=cfg.edge_min_gap_points,
+    )
+    if edges_all.size == 0:
+        raise ValueError("单循环组未检测到高->低边沿。")
+    edge_idx = int(edges_all[0])
+
+    temp_time, temp_data, temp_signal_name = load_temperature_signal(zero_temp_file, cfg)
+    if temp_data.size <= 0:
+        raise ValueError("单循环温度文件为空。")
+
+    # 使用平滑后峰值索引，提高抗噪能力；锚点仍对应“最高点”语义。
+    temp_smooth = smooth_signal(temp_data, cfg.peak_smooth_window)
+    temp_peak_idx = int(np.argmax(temp_smooth))
+
+    voltage_start = 0
+    voltage_end = int(raw_min_len)
+    target_len = voltage_end - voltage_start
+    temp_start = int(temp_peak_idx - edge_idx)
+    temp_end = int(temp_start + target_len)
+
+    # 若温度前段不足，等量裁掉电压头部，维持锚点在对齐后的同一相对位置。
+    if temp_start < 0:
+        head_short = -temp_start
+        voltage_start += head_short
+        temp_start = 0
+        temp_end = temp_start + (voltage_end - voltage_start)
+
+    # 若温度尾段不足，等量裁掉电压尾部，维持等长。
+    if temp_end > int(temp_data.size):
+        tail_over = temp_end - int(temp_data.size)
+        voltage_end -= tail_over
+        temp_end = int(temp_data.size)
+
+    if voltage_end <= voltage_start or temp_end <= temp_start:
+        raise ValueError("单循环对齐后区间无效，请检查阈值/温度峰值。")
+
+    ch1_seg = ch1_raw[voltage_start:voltage_end]
+    ch3_seg = ch3_raw[voltage_start:voltage_end]
+    ch5_seg = ch5_raw[voltage_start:voltage_end]
+    temp_seg = temp_data[temp_start:temp_end]
+    time_seg = temp_time[temp_start:temp_end]
+
+    common_len = int(min(ch1_seg.size, ch3_seg.size, ch5_seg.size, temp_seg.size))
+    if common_len <= 0:
+        raise ValueError("单循环对齐后长度为 0。")
+
+    ch1_seg = ch1_seg[:common_len]
+    ch3_seg = ch3_seg[:common_len]
+    ch5_seg = ch5_seg[:common_len]
+    temp_seg = temp_seg[:common_len]
+    time_seg = time_seg[:common_len]
+
+    temp_peak_local = int(temp_peak_idx - temp_start)
+    result = GroupAlignedResult(
+        device_id=device_id,
+        group_id=zero_group_input.group_id,
+        ch1_file=zero_group_input.ch1_file.name,
+        ch3_file=zero_group_input.ch3_file.name,
+        ch5_file=zero_group_input.ch5_file.name,
+        ch1_raw_len=int(ch1_raw.size),
+        ch3_raw_len=int(ch3_raw.size),
+        ch5_raw_len=int(ch5_raw.size),
+        voltage_start_idx=int(voltage_start),
+        voltage_end_idx=int(voltage_start + common_len),
+        voltage_trim_len=int(voltage_end - voltage_start),
+        falling_edge_count_all=int(edges_all.size),
+        falling_edges_all=[int(x) for x in edges_all.tolist()],
+        falling_edges_used=[int(edge_idx)],
+        temp_peak_count_all=1,
+        temp_peaks_used_global=[int(temp_peak_idx)],
+        temp_peak_idx_global=int(temp_peak_idx),
+        temp_peak_idx_in_segment=temp_peak_local,
+        temp_start_idx=int(temp_start),
+        temp_end_idx=int(temp_start + common_len),
+        aligned_len=common_len,
+        used_cycles=1,
+        is_partial_group=False,
+        alignment_mode="special_zero_group",
+        ch1_segment=ch1_seg,
+        ch3_segment=ch3_seg,
+        ch5_segment=ch5_seg,
+        temperature_segment=temp_seg,
+        temperature_time_segment=time_seg,
+        voltage_raw_signal=ch1_raw,
+    )
+    return result, temp_signal_name
 
 
 def _device_prefix(device_id: str) -> str:
@@ -922,6 +1085,9 @@ def save_outputs(
                 "temp_start_idx",
                 "temp_end_idx",
                 "aligned_len",
+                "used_cycles",
+                "is_partial_group",
+                "alignment_mode",
             ],
         )
         writer.writeheader()
@@ -952,6 +1118,9 @@ def save_outputs(
                     "temp_start_idx": item.temp_start_idx,
                     "temp_end_idx": item.temp_end_idx,
                     "aligned_len": item.aligned_len,
+                    "used_cycles": item.used_cycles,
+                    "is_partial_group": int(item.is_partial_group),
+                    "alignment_mode": item.alignment_mode,
                 }
             )
 
@@ -981,6 +1150,9 @@ def save_outputs(
         temperature_segments=np.asarray([x.temperature_segment for x in results], dtype=object),
         temperature_time_segments=np.asarray([x.temperature_time_segment for x in results], dtype=object),
         aligned_lengths=np.asarray([x.aligned_len for x in results], dtype=np.int32),
+        used_cycles=np.asarray([x.used_cycles for x in results], dtype=np.int32),
+        is_partial_group=np.asarray([x.is_partial_group for x in results], dtype=bool),
+        alignment_mode=np.asarray([x.alignment_mode for x in results], dtype=object),
     )
 
     # 4) MAT 汇总（MATLAB 侧读取）
@@ -1004,6 +1176,9 @@ def save_outputs(
             "device_id": np.array([results[0].device_id if results else ""], dtype=object),
             "group_ids": np.asarray([x.group_id for x in results], dtype=np.int32).reshape(1, -1),
             "aligned_lengths": np.asarray([x.aligned_len for x in results], dtype=np.int32).reshape(1, -1),
+            "used_cycles": np.asarray([x.used_cycles for x in results], dtype=np.int32).reshape(1, -1),
+            "is_partial_group": np.asarray([x.is_partial_group for x in results], dtype=np.uint8).reshape(1, -1),
+            "alignment_mode": np.asarray([x.alignment_mode for x in results], dtype=object).reshape(1, -1),
             "ch1_segments": ch1_cells,
             "ch3_segments": ch3_cells,
             "ch5_segments": ch5_cells,
@@ -1159,6 +1334,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--high-threshold", type=float, default=2.0, help="高电平阈值（V），默认 2.0")
     parser.add_argument("--sample-rate", type=float, default=10.0, help="采样率（Hz），默认 10")
     parser.add_argument("--cycles-per-group", type=int, default=10, help="每组包含周期数，默认 10")
+    parser.add_argument(
+        "--allow-partial-last-group",
+        dest="allow_partial_last_group",
+        action="store_true",
+        help="允许最后一组不足 cycles-per-group 时按部分循环对齐（默认开启）",
+    )
+    parser.add_argument(
+        "--no-allow-partial-last-group",
+        dest="allow_partial_last_group",
+        action="store_false",
+        help="禁用最后一组部分循环对齐",
+    )
+    parser.set_defaults(allow_partial_last_group=True)
+    parser.add_argument(
+        "--partial-min-cycles",
+        type=int,
+        default=3,
+        help="最后一组启用部分循环时允许的最少循环数（默认 3）",
+    )
     parser.add_argument("--pre-points", type=int, default=155, help="边沿前保留点数，默认 155")
     parser.add_argument("--post-points", type=int, default=245, help="边沿后保留点数，默认 245")
     parser.add_argument(
@@ -1192,6 +1386,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-plots", dest="save_plots", action="store_true", help="保存可视化检查图（默认开启）")
     parser.add_argument("--no-save-plots", dest="save_plots", action="store_false", help="不保存可视化检查图")
     parser.set_defaults(save_plots=True)
+    parser.add_argument(
+        "--process-zero-group",
+        dest="process_zero_group",
+        action="store_true",
+        help="处理 _0_ 温度文件对应的单循环独立组（默认开启）",
+    )
+    parser.add_argument(
+        "--skip-zero-group",
+        dest="process_zero_group",
+        action="store_false",
+        help="跳过 _0_ 单循环独立组处理",
+    )
+    parser.set_defaults(process_zero_group=True)
 
     parser.add_argument("--strict", action="store_true", help="严格模式：任一组异常即终止（默认跳过异常组）")
     parser.add_argument("--max-groups", type=int, default=0, help="最多处理多少组（0 表示全部）")
@@ -1229,13 +1436,16 @@ def main() -> None:
         temp_signal_name=args.temp_name,
         max_groups=args.max_groups,
         strict_mode=args.strict,
+        allow_partial_last_group=args.allow_partial_last_group,
+        partial_min_cycles=args.partial_min_cycles,
     )
 
     if args.list_temp_signals:
         for device_id in device_ids:
             device_dir = discover_device_dir(input_root, device_id)
             temp_dir = device_dir / "温度"
-            temp_files = discover_temperature_files(temp_dir, device_id)
+            regular_temp_files, zero_temp_files = discover_temperature_files(temp_dir, device_id)
+            temp_files = regular_temp_files + zero_temp_files
             if not temp_files:
                 print(f"[WARN] 器件 {device_id}: 温度目录无可用文件 ({temp_dir})")
                 continue
@@ -1256,40 +1466,97 @@ def main() -> None:
         if not temp_dir.is_dir():
             raise FileNotFoundError(f"器件 {device_id} 的温度目录不存在: {temp_dir}")
 
-        group_inputs = discover_pc_group_inputs(pc_dir, device_id)
-        if cfg.max_groups > 0:
-            group_inputs = group_inputs[: cfg.max_groups]
-        if not group_inputs:
-            raise FileNotFoundError(f"器件 {device_id} 未找到完整组数据（需同时存在 ch1/ch3/ch5）。")
-        device_group_count_found = len(group_inputs)
+        all_group_inputs = discover_pc_group_inputs(pc_dir, device_id)
+        zero_group_input = next((x for x in all_group_inputs if x.group_id == 0), None)
+        regular_group_inputs = [x for x in all_group_inputs if x.group_id != 0]
 
-        print(f"[1/4] 发现完整电压组: {len(group_inputs)}")
-        for row in group_inputs:
+        if cfg.max_groups > 0:
+            regular_group_inputs = regular_group_inputs[: cfg.max_groups]
+
+        if not all_group_inputs:
+            raise FileNotFoundError(f"器件 {device_id} 未找到完整组数据（需同时存在 ch1/ch3/ch5）。")
+
+        print(f"[1/4] 发现完整电压组(含group0): {len(all_group_inputs)}")
+        print(f"  常规组数(排除group0): {len(regular_group_inputs)}")
+        print(f"  是否存在group0单循环组: {'是' if zero_group_input is not None else '否'}")
+        for row in regular_group_inputs:
             print(
                 f"  group={row.group_id:02d} "
                 f"ch1={row.ch1_file.name} ch3={row.ch3_file.name} ch5={row.ch5_file.name}"
             )
+        if zero_group_input is not None:
+            print(
+                f"  group=00 ch1={zero_group_input.ch1_file.name} "
+                f"ch3={zero_group_input.ch3_file.name} ch5={zero_group_input.ch5_file.name}"
+            )
 
-        temp_files = discover_temperature_files(temp_dir, device_id)
-        if not temp_files:
+        regular_temp_files, zero_temp_files = discover_temperature_files(temp_dir, device_id)
+        if not regular_temp_files and not zero_temp_files:
             raise FileNotFoundError(f"器件 {device_id} 温度目录下未找到匹配文件: {temp_dir}")
 
-        print("[2/4] 读取并拼接温度文件 ...")
-        print("  " + ", ".join(p.name for p in temp_files))
-        temp_time, temp_data, temp_signal_name = load_temperature_series_from_files(temp_files, cfg)
-        print(f"  温度信号: {temp_signal_name}")
-        print(f"  温度长度: {temp_data.size}")
+        print("[2/4] 读取温度文件列表 ...")
+        if regular_temp_files:
+            print("  常规温度文件: " + ", ".join(p.name for p in regular_temp_files))
+        else:
+            print("  常规温度文件: 无")
+        if zero_temp_files:
+            print("  _0_单循环温度文件: " + ", ".join(p.name for p in zero_temp_files))
+        else:
+            print("  _0_单循环温度文件: 无")
 
-        print("[3/4] 开始逐组切除 + 对齐 ...")
-        results = align_groups(
-            device_id=device_id,
-            group_inputs=group_inputs,
-            temperature_time=temp_time,
-            temperature_data=temp_data,
-            cfg=cfg,
-        )
+        print("[3/4] 开始对齐 ...")
+        results: list[GroupAlignedResult] = []
+        used_temp_signal_names: list[str] = []
+
+        # 3.1 常规组：只用 regular_temp_files，确保主流程跳过 _0_ 文件
+        if regular_group_inputs:
+            if not regular_temp_files:
+                raise FileNotFoundError(
+                    f"器件 {device_id} 存在常规电压组，但未找到常规温度区间文件（如 *_1-10_*）。"
+                )
+            temp_time, temp_data, temp_signal_name_regular = load_temperature_series_from_files(regular_temp_files, cfg)
+            print(f"  常规温度信号: {temp_signal_name_regular}，长度: {temp_data.size}")
+            regular_results = align_groups(
+                device_id=device_id,
+                group_inputs=regular_group_inputs,
+                temperature_time=temp_time,
+                temperature_data=temp_data,
+                cfg=cfg,
+            )
+            results.extend(regular_results)
+            used_temp_signal_names.append(temp_signal_name_regular)
+
+        # 3.2 group0 单循环独立处理：锚点对齐（电压边沿 vs 温度最高点）
+        if args.process_zero_group:
+            if zero_group_input is not None and zero_temp_files:
+                if len(zero_temp_files) > 1:
+                    print(
+                        "[WARN] 检测到多个 _0_ 温度文件，当前仅使用第一个: "
+                        f"{zero_temp_files[0].name}"
+                    )
+                zero_result, temp_signal_name_zero = align_zero_group(
+                    device_id=device_id,
+                    zero_group_input=zero_group_input,
+                    zero_temp_file=zero_temp_files[0],
+                    cfg=cfg,
+                )
+                results.append(zero_result)
+                used_temp_signal_names.append(temp_signal_name_zero)
+            elif zero_group_input is not None and not zero_temp_files:
+                print("[WARN] 存在 group0 电压组，但未找到对应 _0_ 温度文件，已跳过 group0。")
+            elif zero_group_input is None and zero_temp_files:
+                print("[WARN] 找到 _0_ 温度文件，但未找到 group0 电压组，已跳过 _0_ 文件。")
+        else:
+            if zero_group_input is not None or zero_temp_files:
+                print("[INFO] 已按参数 --skip-zero-group 跳过 _0_ 单循环组处理。")
+
         if not results:
             raise RuntimeError(f"器件 {device_id} 没有可用对齐结果（全部组被跳过）。")
+
+        # 统一按组号排序，确保输出与可视化按组递增
+        results = sorted(results, key=lambda x: int(x.group_id))
+        temp_signal_name = " / ".join(sorted(set(used_temp_signal_names))) if used_temp_signal_names else "temperature"
+        device_group_count_found = len(regular_group_inputs) + (1 if zero_group_input is not None else 0)
 
         output_dir = (output_root / f"{device_id}号").resolve()
         print("[4/4] 写出结果文件 ...")
@@ -1314,6 +1581,7 @@ def main() -> None:
         for item in results:
             print(
                 f"  group={item.group_id:02d}, aligned_len={item.aligned_len}, "
+                f"mode={item.alignment_mode}, used_cycles={item.used_cycles}, "
                 f"voltage_idx=[{item.voltage_start_idx},{item.voltage_end_idx}), "
                 f"temp_idx=[{item.temp_start_idx},{item.temp_end_idx})"
             )
