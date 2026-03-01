@@ -592,6 +592,49 @@ def decide_cycles_for_group(detected_count: int, cfg: AlignConfig, is_last_group
     return used, True
 
 
+def select_zero_group_edge(voltage: np.ndarray, edges: np.ndarray, cfg: AlignConfig) -> int:
+    """
+    为 _0_ 单循环组选择最可信的“高->低”边沿。
+
+    评分思路：
+    - pre_high_ratio：边沿前窗口中“高电平”占比（越高越好）
+    - post_low_ratio：边沿后窗口中“低电平”占比（越高越好）
+    - drop_norm：边沿瞬时跌落幅度（归一化后越大越好）
+    """
+    if edges.size == 0:
+        raise ValueError("_0_ 单循环组没有可用边沿候选。")
+
+    pre_pts = max(5, int(round(3.0 * cfg.sample_rate_hz)))
+    post_pts = max(5, int(round(3.0 * cfg.sample_rate_hz)))
+    low_level_threshold = min(cfg.high_level_threshold * 0.5, 1.0)
+    amp_span = max(1e-6, float(np.max(voltage) - np.min(voltage)))
+
+    best_edge = int(edges[0])
+    best_score = -1e12
+
+    for e in edges:
+        edge = int(e)
+        pre = voltage[max(0, edge - pre_pts) : edge]
+        post = voltage[edge : min(voltage.size, edge + post_pts)]
+        if pre.size < 3 or post.size < 3:
+            continue
+
+        pre_high_ratio = float(np.mean(pre > cfg.high_level_threshold))
+        post_low_ratio = float(np.mean(post < low_level_threshold))
+
+        pre_short = pre[-min(pre.size, 5) :]
+        post_short = post[: min(post.size, 5)]
+        drop = float(np.mean(pre_short) - np.mean(post_short))
+        drop_norm = drop / amp_span
+
+        score = 3.0 * pre_high_ratio + 4.0 * post_low_ratio + 2.0 * drop_norm
+        if score > best_score:
+            best_score = score
+            best_edge = edge
+
+    return best_edge
+
+
 def _list_temperature_signals_matlab(temp_file: Path) -> list[str]:
     """用 matlab.engine 枚举 Simulink Dataset 中的信号名。"""
     try:
@@ -936,14 +979,16 @@ def align_zero_group(
     ch3_raw = ch3_raw[:raw_min_len]
     ch5_raw = ch5_raw[:raw_min_len]
 
+    # _0_ 单循环组使用更小的 min_gap，先收集更多候选，再通过评分选最可信边沿。
+    zero_min_gap = max(1, int(round(cfg.sample_rate_hz)))
     edges_all = detect_falling_edges(
         voltage=ch1_raw,
         threshold=cfg.high_level_threshold,
-        min_gap_points=cfg.edge_min_gap_points,
+        min_gap_points=zero_min_gap,
     )
     if edges_all.size == 0:
         raise ValueError("单循环组未检测到高->低边沿。")
-    edge_idx = int(edges_all[0])
+    edge_idx = select_zero_group_edge(ch1_raw, edges_all, cfg)
 
     temp_time, temp_data, temp_signal_name = load_temperature_signal(zero_temp_file, cfg)
     if temp_data.size <= 0:
