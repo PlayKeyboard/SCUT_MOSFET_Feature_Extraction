@@ -50,10 +50,11 @@ import numpy as np
 # =========================
 # 快速改参区（后期最常改）
 # =========================
-DEFAULT_INPUT_ROOT = "data"
-DEFAULT_OUTPUT_ROOT = "data/aligned_output"
+
+DEFAULT_INPUT_ROOT = r'H:\2026.2.10数据\老化数据' #"data"
+DEFAULT_OUTPUT_ROOT = r'G:\深度学习资料\双脉冲实验平台\2026.3.1整理数据输出\aligned_output'  #"data/aligned_output"
 # 可手动填入多个器件编号，如 ["12", "13", "21"]
-DEFAULT_DEVICE_IDS = ["12"]
+DEFAULT_DEVICE_IDS = ['13']
 
 
 PC_FILE_RE = re.compile(r"^(\d{8})_PC_(\d+)_(\d+)_ch(\d+)\.mat$", re.IGNORECASE)
@@ -1168,7 +1169,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # 温度信号读取参数（参考 tempture.py）
-    parser.add_argument("--temp-mode", choices=["index", "name"], default="index", help="按索引或名称读取温度信号")
+    parser.add_argument("--temp-mode", choices=["index", "name"], default="name", help="按索引或名称读取温度信号")
     parser.add_argument("--temp-index", type=int, default=9, help="temp-mode=index 时生效（MATLAB 1-based）")
     parser.add_argument("--temp-name", default="tempture", help="temp-mode=name 时生效")
     parser.add_argument("--list-temp-signals", action="store_true", help="仅列出温度文件中的信号并退出")
