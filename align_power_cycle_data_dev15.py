@@ -18,8 +18,8 @@ import numpy as np
 import align_power_cycle_data as base
 
 
-DEFAULT_INPUT_ROOT = "data"
-DEFAULT_OUTPUT_ROOT = "data/aligned_output_15"
+DEFAULT_INPUT_ROOT = r"H:\2026.2.10数据\老化数据"
+DEFAULT_OUTPUT_ROOT = r"G:\深度学习资料\双脉冲实验平台\2026.3.1整理数据输出\aligned_output"
 DEFAULT_DEVICE_IDS = ["15"]
 
 

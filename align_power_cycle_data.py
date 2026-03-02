@@ -59,9 +59,9 @@ import numpy as np
 DEFAULT_INPUT_ROOT = r'H:\2026.2.10数据\老化数据' #"data"
 DEFAULT_OUTPUT_ROOT = r'G:\深度学习资料\双脉冲实验平台\2026.3.1整理数据输出\aligned_output'  #"data/aligned_output"
 # 可手动填入多个器件编号，如 ["12", "13", "21"]
-DEFAULT_DEVICE_IDS = ['17']
+DEFAULT_DEVICE_IDS = ['19', '24', '25']
 # 部分循环最小循环数（可改为 1，但误检风险更高）
-DEFAULT_PARTIAL_MIN_CYCLES = 3
+DEFAULT_PARTIAL_MIN_CYCLES = 1
 
 
 PC_FILE_RE = re.compile(r"^(\d{8})_PC_(\d+)_(\d+)_ch(\d+)\.mat$", re.IGNORECASE)
