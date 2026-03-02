@@ -60,6 +60,8 @@ DEFAULT_INPUT_ROOT = r'H:\2026.2.10数据\老化数据' #"data"
 DEFAULT_OUTPUT_ROOT = r'G:\深度学习资料\双脉冲实验平台\2026.3.1整理数据输出\aligned_output'  #"data/aligned_output"
 # 可手动填入多个器件编号，如 ["12", "13", "21"]
 DEFAULT_DEVICE_IDS = ['17']
+# 部分循环最小循环数（可改为 1，但误检风险更高）
+DEFAULT_PARTIAL_MIN_CYCLES = 3
 
 
 PC_FILE_RE = re.compile(r"^(\d{8})_PC_(\d+)_(\d+)_ch(\d+)\.mat$", re.IGNORECASE)
@@ -98,7 +100,9 @@ class AlignConfig:
     max_groups: int = 0
     strict_mode: bool = False
     allow_partial_last_group: bool = True
-    partial_min_cycles: int = 1
+    allow_partial_any_group: bool = False
+    partial_min_cycles: int = DEFAULT_PARTIAL_MIN_CYCLES
+    allow_single_cycle_temp_peak_fallback: bool = True
 
     @property
     def expected_cycle_points(self) -> int:
@@ -574,20 +578,25 @@ def decide_cycles_for_group(detected_count: int, cfg: AlignConfig, is_last_group
 
     规则：
     1) 常规情况：>= cycles_per_group 时按满组处理
-    2) 不足满组：仅当“最后一组 + 允许部分组”时启用部分循环
+    2) 不足满组：按配置决定是否允许部分循环
+       - allow_partial_last_group=True：允许最后一组部分循环
+       - allow_partial_any_group=True：允许任意组部分循环
     3) 部分组仍需满足 partial_min_cycles
     """
     target = int(cfg.cycles_per_group)
     if detected_count >= target:
         return target, False
 
-    if not (cfg.allow_partial_last_group and is_last_group):
+    allow_partial = bool(cfg.allow_partial_any_group) or (
+        bool(cfg.allow_partial_last_group) and bool(is_last_group)
+    )
+    if not allow_partial:
         raise ValueError(f"检测到边沿数量不足：{detected_count}，期望至少 {target}。")
 
     used = int(detected_count)
     if used < int(max(1, cfg.partial_min_cycles)):
         raise ValueError(
-            f"最后一组边沿数仅 {used}，低于 partial_min_cycles={cfg.partial_min_cycles}，无法做部分组对齐。"
+            f"边沿数仅 {used}，低于 partial_min_cycles={cfg.partial_min_cycles}，无法做部分组对齐。"
         )
     return used, True
 
@@ -886,6 +895,14 @@ def align_groups(
 
             temp_remaining = temperature_data[temp_cursor:]
             temp_peaks_rel = detect_temperature_peaks(temp_remaining, cfg)
+            if (
+                temp_peaks_rel.size == 0
+                and used_cycles == 1
+                and is_partial
+                and cfg.allow_single_cycle_temp_peak_fallback
+            ):
+                # 对“单循环部分组”做兜底：若无局部峰，使用全局最大值作为锚点。
+                temp_peaks_rel = np.asarray([int(np.argmax(temp_remaining))], dtype=int)
             temp_peaks_used_rel = select_group_edges(
                 edges=temp_peaks_rel,
                 cycles_per_group=used_cycles,
@@ -939,7 +956,11 @@ def align_groups(
                     aligned_len=common_len,
                     used_cycles=used_cycles,
                     is_partial_group=is_partial,
-                    alignment_mode=("regular_partial_last" if is_partial else "regular_full"),
+                    alignment_mode=(
+                        "regular_partial_last"
+                        if (is_partial and idx == total_groups - 1)
+                        else ("regular_partial_any" if is_partial else "regular_full")
+                    ),
                     ch1_segment=ch1_aligned,
                     ch3_segment=ch3_aligned,
                     ch5_segment=ch5_aligned,
@@ -1393,10 +1414,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(allow_partial_last_group=True)
     parser.add_argument(
+        "--allow-partial-any-group",
+        action="store_true",
+        help="允许任意组（不只最后一组）在边沿不足时按部分循环对齐",
+    )
+    parser.add_argument(
         "--partial-min-cycles",
         type=int,
-        default=3,
-        help="最后一组启用部分循环时允许的最少循环数（默认 3）",
+        default=DEFAULT_PARTIAL_MIN_CYCLES,
+        help="启用部分循环时允许的最少循环数（默认 3，可设为 1）",
     )
     parser.add_argument("--pre-points", type=int, default=155, help="边沿前保留点数，默认 155")
     parser.add_argument("--post-points", type=int, default=245, help="边沿后保留点数，默认 245")
@@ -1427,6 +1453,19 @@ def parse_args() -> argparse.Namespace:
         default=20.0,
         help="温度峰值最小间隔（秒），用于剔除噪声峰",
     )
+    parser.add_argument(
+        "--allow-single-cycle-temp-peak-fallback",
+        dest="allow_single_cycle_temp_peak_fallback",
+        action="store_true",
+        help="单循环部分组在温度无局部峰时，允许回退到温度最大值对齐（默认开启）",
+    )
+    parser.add_argument(
+        "--no-allow-single-cycle-temp-peak-fallback",
+        dest="allow_single_cycle_temp_peak_fallback",
+        action="store_false",
+        help="禁用单循环部分组温度峰值回退",
+    )
+    parser.set_defaults(allow_single_cycle_temp_peak_fallback=True)
 
     parser.add_argument("--save-plots", dest="save_plots", action="store_true", help="保存可视化检查图（默认开启）")
     parser.add_argument("--no-save-plots", dest="save_plots", action="store_false", help="不保存可视化检查图")
@@ -1482,7 +1521,15 @@ def main() -> None:
         max_groups=args.max_groups,
         strict_mode=args.strict,
         allow_partial_last_group=args.allow_partial_last_group,
+        allow_partial_any_group=args.allow_partial_any_group,
         partial_min_cycles=args.partial_min_cycles,
+        allow_single_cycle_temp_peak_fallback=args.allow_single_cycle_temp_peak_fallback,
+    )
+    print(
+        "[CFG] "
+        f"partial_min_cycles={cfg.partial_min_cycles}, "
+        f"allow_partial_last_group={cfg.allow_partial_last_group}, "
+        f"allow_partial_any_group={cfg.allow_partial_any_group}"
     )
 
     if args.list_temp_signals:
